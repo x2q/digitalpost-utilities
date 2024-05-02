@@ -5,8 +5,8 @@ import smtplib										# Sending e-mails
 from email.mime.multipart import MIMEMultipart		# Creating multipart e-mails
 from email.mime.text import MIMEText				# Attaching text to e-mails
 from email.mime.application import MIMEApplication	# Attaching files to e-mails
-from email.utils import formataddr					# Used for correct encoding of senders with special characters in name (e.g. Københavns Kommune)
-from mit_dk_configuration import email_data, tokens_filename
+from email.utils import formataddr					# Used for correct encoding of senders with special characters in name (e.g. Kbenhavns Kommune)
+from mit_dk_configuration import email_data, company_email_data, tokens_filename
 import time
 
 base_url = 'https://gateway.mit.dk/view/client/'
@@ -93,7 +93,9 @@ def get_fresh_tokens_and_revoke_old_tokens():
 def get_simple_endpoint(endpoint):
     tries = 1
     while tries <= 3:
-        response = session.get(base_url + endpoint)
+        request = base_url + endpoint
+        #print(f'Request: {request}')
+        response = session.get(request)
         try:
             response_json = response.json()
             return response.json()
@@ -113,12 +115,14 @@ def get_inbox_folders_and_build_query(mailbox_ids):
         'mailboxes': {}
     }
     for mailbox in mailbox_ids:
+        #print (f'Get inbox folder and build query for mailbox_ids:', mailbox['mailboxId'])
         json_data['mailboxes'][mailbox['dataSource']] = mailbox['mailboxId']
     tries = 1
     while tries <= 3:
         response = session.post(base_url + endpoint, json=json_data)    
         try:
             response_json = response.json()
+            #print(f'reponse json: {response_json}')
             folders = []
             for folder in response_json['folders']['INBOX']:
                 folder_info = {
@@ -128,6 +132,7 @@ def get_inbox_folders_and_build_query(mailbox_ids):
                     'startIndex': 0
                 }
                 folders.append(folder_info)
+                #print(f'folder info {folder_info}')
             return folders
         except:
             tries += 1
@@ -145,7 +150,7 @@ def get_messages(folders):
         json_data = {
             'any': [],
             'folders': folders,
-            'size': 20,
+            'size': 60,
             'sortFields': ['receivedDateTime:DESC']
         }
         response = session.post(base_url + endpoint, json=json_data)    
@@ -186,24 +191,11 @@ def mark_as_read(message):
     }
     mark_as_read = session.patch(base_url + endpoint, json=json_data)
 
-mailserver_connect = False            
-tokens = get_fresh_tokens_and_revoke_old_tokens()
-if tokens:
-    session.headers['mitdkToken'] = tokens['dpp']['access_token']
-    session.headers['ngdpToken'] = tokens['ngdp']['access_token']
-    session.headers['platform'] = 'web'
-    mailboxes = get_simple_endpoint('mailboxes')
-    mailbox_ids = []
-    for mailboxes in mailboxes['groupedMailboxes']:
-        for mailbox in mailboxes['mailboxes']:
-            mailbox_info = {
-                'dataSource': mailbox['dataSource'],
-                'mailboxId': mailbox['id']
-            }
-            mailbox_ids.append(mailbox_info)
-    folders = get_inbox_folders_and_build_query(mailbox_ids)
-    messages = get_messages(folders)
+def get_and_send_messages(messages, company_mail, company_bilag_mail, company_name):
+    mailserver_connect = False
+    sent_messages = 0
     for message in messages['results']:
+        message['read'] = False
         if message['read'] == False:
             if mailserver_connect == False:
                 server = smtplib.SMTP(email_data['emailserver'], email_data['emailserverport'])
@@ -217,8 +209,8 @@ if tokens:
 
             msg = MIMEMultipart('alternative')
             msg['From'] = formataddr((sender, email_data['emailfrom']))
-            msg['To'] = email_data['emailto']
-            msg['Subject'] = "mit.dk: " + label
+            msg['To'] = company_mail
+            msg['Subject'] = "mit.dk: " + company_name + " - " + label
 
             for content in message_content:
                 if content['encoding_format'] == 'text/plain':
@@ -243,8 +235,58 @@ if tokens:
                     part = MIMEApplication(content['file_content'].content)
                     part.add_header('Content-Disposition', 'attachment', filename=content['file_name'])
                     msg.attach(part)
-            print(f'Sender en mail fra mit.dk fra {sender} med emnet {label}')
-            server.sendmail(email_data['emailfrom'], email_data['emailto'], msg.as_string())
+            print(f'Sending mail from mit.dk from {sender} with label {label} to {company_mail}')
+            server.sendmail(email_data['emailfrom'], company_mail, msg.as_string())
+            if company_bilag_mail != "":
+                print(f'Sending mail from mit.dk from {sender} with label {label} to {company_bilag_mail}')
+                del msg["To"]
+                msg['To']  = company_bilag_mail
+                server.sendmail(email_data['emailfrom'], company_bilag_mail, msg.as_string())
             mark_as_read(message)
+            sent_messages +1
     if mailserver_connect:
         server.quit()
+    return sent_messages
+
+
+
+
+mailserver_connect = False            
+tokens = get_fresh_tokens_and_revoke_old_tokens()
+if tokens:
+    session.headers['mitdkToken'] = tokens['dpp']['access_token']
+    session.headers['ngdpToken'] = tokens['ngdp']['access_token']
+    session.headers['platform'] = 'web'
+    company_mail = ""
+    company_bilag_mail = ""
+    company_name = ""
+    mailboxes = get_simple_endpoint('mailboxes?dataSource=PUBLIC_PRIVATE&includeAll=true')
+    mailbox_ids = []
+    
+    for mailboxes in mailboxes['groupedMailboxes']:
+        for mailbox in mailboxes['mailboxes']:
+            mailbox_ids = []
+            mailbox_info = {
+                'dataSource': mailbox['dataSource'],
+                'mailboxId': mailbox['id']
+            }
+            mailbox_ids.append(mailbox_info)
+            
+            company_name = ""
+            company_mail = "finance@nclear.dk"
+            company_bilag_mail = ""
+            try:        
+                details = company_email_data[mailbox['ownerExternalId']]
+                company_mail = details["Mail"]
+                company_bilag_mail = details["BilagMail"]
+                company_name = "" + mailbox['ownerName']
+            except:
+                pass
+
+            print('Found mailbox:', company_name, '(CVR:', mailbox['ownerExternalId'], ') mailboxId:', mailbox['id'])
+            if mailbox['ownerExternalId'] in ('36444096'): #only CLRHS Holding remains
+                folders = get_inbox_folders_and_build_query(mailbox_ids)
+                messages = get_messages(folders)
+                messages_sent = get_and_send_messages(messages, company_mail, company_bilag_mail, company_name)
+                print(f'Sent {messages_sent} messages')
+
